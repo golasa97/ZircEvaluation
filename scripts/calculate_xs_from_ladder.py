@@ -132,7 +132,7 @@ def process_file(filepath, output_dir, nuc, grid_params):
                 R_jl = 0j 
                 for res in resonances_by_channel[channel]:
                     # Use Gn0 for the R-Matrix calculation
-                    R_jl += res['Gn0 (eV)'] / (res['E_r (eV)'] - E - 1j * res['Gg (eV)'] / 2.0)
+                    R_jl += res['Gn (eV)'] / (res['E_r (eV)'] - E - 1j * res['Gg (eV)'] / 2.0)
 
                 P = P_grid[l, i]
                 S = S_grid[l, i]

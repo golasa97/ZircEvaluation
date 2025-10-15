@@ -8,15 +8,148 @@ from tqdm import tqdm
 import concurrent.futures
 
 # Add the project root to the Python path to allow importing PySesh
-#project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-#if project_root not in sys.path:
+# project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# if project_root not in sys.path:
 #    sys.path.insert(0, project_root)
 import PySesh
+
+# --- Physics functions needed to calculate Gn0 from Gn ---
+
+def kfunc(E, A):
+    """Vectorized wave number k (in units of 1/sqrt(barn))."""
+    E = np.asarray(E)
+    k2 = np.zeros_like(E, dtype=float)
+    mask = E > 0
+    k2[mask] = 2.1968e-3 * E[mask] * (A / (A + 1))
+    return np.sqrt(k2)
+
+def p_factors_vec(E_vec, A, a, lmax):
+    """
+    Vectorized calculation of penetrability (P) for all l-waves up to lmax.
+    """
+    k_vec = kfunc(E_vec, A)
+    a_barn = a * 0.1
+    rho_vec = k_vec * a_barn
+    
+    P_l = np.zeros((lmax + 1, len(E_vec)))
+    mask = rho_vec > 1e-12
+
+    # l=0
+    P_l[0, mask] = rho_vec[mask]
+    if lmax > 0:
+        # l=1
+        rho_sq = rho_vec[mask]**2
+        P_l[1, mask] = rho_sq / (1.0 + rho_sq)
+    if lmax > 1:
+        # l=2
+        rho_4 = rho_sq**2
+        P_l[2, mask] = rho_4 / (9.0 + 3.0 * rho_sq + rho_4)
+    if lmax > 2:
+        # l=3
+        rho_6 = rho_4 * rho_sq
+        P_l[3, mask] = rho_6 / (225.0 + 45.0 * rho_sq + 6.0 * rho_4 + rho_6)
+    return P_l
+
+def default_channel_factory():
+    """Provides a default dictionary structure for a new (L, J) channel."""
+    return {'E': [], 'D_J': [], 'Gn0': [], 'Gg': [], 'AMUN': 0}
+
+
+
+def p_factor_single(E, A, a, l):
+    """Calculates penetrability for a single energy and l-wave."""
+    if E <= 1e-9: # Avoid sqrt of zero or negative
+        return 0.0
+    
+    # Constant is approx (2 * m_n / hbar^2) in units of (1/barn)/eV
+    k2 = 2.1968e-3 * E * (A / (A + 1))
+    k = np.sqrt(k2)
+    
+    # Convert channel radius from fm to sqrt(barn)
+    a_barn = a * 0.1
+    rho = k * a_barn
+
+    if rho < 1e-9:
+        return 0.0
+
+    if l == 0:
+        return rho
+    elif l == 1:
+        rho2 = rho**2
+        return rho2 / (1.0 + rho2)
+    elif l == 2:
+        rho2 = rho**2
+        rho4 = rho2**2
+        return rho4 / (9.0 + 3.0 * rho2 + rho4)
+    elif l == 3:
+        rho2 = rho**2
+        rho4 = rho2**2
+        rho6 = rho4*rho2
+        return rho6 / (225.0 + 45.0 * rho2 + 6.0 * rho4 + rho6)
+    
+    return 0.0 # For l > 3, not implemented
+
+def sample_statistical_ladder(E_grid, D_J_grid, Gn0_grid, Gg_grid, l, j, nu_Gn, nu_Gg, A, a):
+    """
+    Generates a statistical resonance ladder for a single (L, J) channel
+    by interpolating the mean parameters on the provided energy grid.
+    """
+    ladder = []
+    
+    # Ensure grids are numpy arrays for interpolation
+    E_grid = np.asarray(E_grid)
+    D_J_grid = np.asarray(D_J_grid)
+    Gn0_grid = np.asarray(Gn0_grid)
+    Gg_grid = np.asarray(Gg_grid)
+
+    E_min, E_max = E_grid[0], E_grid[-1]
+    
+    # Start sampling with a random step from the beginning of the energy range
+    D_J_start = np.interp(E_min, E_grid, D_J_grid)
+    current_E = E_min - (D_J_start * np.log(np.random.rand()))
+
+    while current_E < E_max:
+        # 1. Interpolate the average level spacing at the current energy
+        # Use left=D_J_grid[0] to handle cases where current_E is slightly below E_min
+        avg_D_at_E = np.interp(current_E, E_grid, D_J_grid, left=D_J_grid[0])
+        if avg_D_at_E <= 0: # Safety check for invalid spacing
+            break
+
+        # 2. Sample the next spacing from a Wigner distribution (using exponential approximation)
+        spacing =1.12837 * avg_D_at_E *np.sqrt(-np.log(np.random.rand()))
+        current_E += spacing
+        
+        if current_E >= E_max:
+            break
+            
+        # 3. Interpolate the average widths at the new resonance energy
+        avg_Gn0_at_E = np.interp(current_E, E_grid, Gn0_grid)
+        avg_Gg_at_E = np.interp(current_E, E_grid, Gg_grid)
+
+        # 4. Sample the actual widths from chi-squared distributions (Porter-Thomas is nu=1)
+        Gn0_sample = avg_Gn0_at_E * np.random.chisquare(nu_Gn) / nu_Gn if avg_Gn0_at_E > 0 else 0.0
+        Gg_sample = avg_Gg_at_E 
+        
+        # 5. Calculate the full neutron width Gn from the reduced width Gn0
+        penetrability = p_factor_single(current_E, A, a, l)
+        Gn_sample = Gn0_sample * np.sqrt(current_E) * penetrability
+        
+        ladder.append({
+            'E': current_E,
+            'Gn': Gn_sample,
+            'Gg': Gg_sample,
+            'L': l,
+            'J': j
+        })
+        
+    return ladder
+
+
 
 
 def read_urr_parameters(filepath):
     """Reads the URR parameter CSV file into a dictionary keyed by (L, J)."""
-    params_by_channel = defaultdict(lambda: {'E': [], 'D_J': [], 'Gn0': [], 'Gg': [], 'AMUN' : 0})
+    params_by_channel = defaultdict(default_channel_factory)
     ground_state_spin = None
     with open(filepath, 'r') as f:
         reader = csv.reader(f, delimiter=';')
@@ -36,116 +169,65 @@ def read_urr_parameters(filepath):
                 params_by_channel[channel]['D_J'].append(float(row[idx['D_J']]))
                 params_by_channel[channel]['Gn0'].append(float(row[idx['Gn0']]))
                 params_by_channel[channel]['Gg'].append(float(row[idx['Gg']]))
-                params_by_channel[channel]['AMUN'] = float(row[idx['AMUN']])
-            except (ValueError, IndexError):
-                print(f"Skipping malformed row: {row}")
+                params_by_channel[channel]['AMUN'] = int(float(row[idx['AMUN']]))
+                
+            except (ValueError, KeyError, IndexError) as e:
+                print(f"Skipping malformed row {i+2} in {filepath}: {row}. Error: {e}")
                 continue
+    return params_by_channel, ground_state_spin
 
-    # Convert lists to numpy arrays for easier interpolation
-    for channel in params_by_channel:
-        for key in params_by_channel[channel]:
-            params_by_channel[channel][key] = np.array(params_by_channel[channel][key])
-            
-    return dict(params_by_channel), ground_state_spin
 
-def sample_full_ladder(params_by_channel, mass, chan_rad):
-    """
-    Samples a complete resonance ladder across the entire energy range defined
-    in the parameter file.
-    """
-    # Create a Sesh object with the correct physics parameters for penetrability calculation.
-    # Other parameters are dummies but need to have the correct shape to avoid init errors.
-    sesh_sampler = PySesh.Sesh(mass, 1, 1, chan_rad, 1, 1, 2, np.array([1,1]), np.array([1,1]), np.array([1,1]))
+def generate_and_write_ladder(task_args):
+    """Samples one complete resonance ladder and writes it to a file."""
+    params_by_channel, mass, radius, output_filename, isotope_name, spin = task_args
     
     full_ladder = []
     
-    # Determine the global energy range from the data
-    all_energies = [e for channel_data in params_by_channel.values() for e in channel_data['E']]
-    if not all_energies:
-        return [], 0, 0
-    e_min = min(all_energies)
-    e_max = max(all_energies)
+    max_l = max(l for l, j in params_by_channel.keys())
 
-    rng1 = np.random.default_rng()
-    wig_factor = np.sqrt(-np.log(rng1.random(10000000)))
-    pt_factor_1 = rng1.chisquare(1, 10000000)
-    pt_factor_2 = rng1.chisquare(2, 10000000)
-
-    pt_factor = [0, pt_factor_1, pt_factor_2]
-
-    i = 0
-
-    for channel, data in params_by_channel.items():
-        l, j = channel
-        
-        if len(data['E']) < 2:
+    for (l, j), params in params_by_channel.items():
+        if not params['E']:
             continue
-
-        current_e = e_min
         
-        while current_e < e_max:
-            i += i
-            # Interpolate parameters at the current energy to find the next spacing
-            d_avg = np.interp(current_e, data['E'], data['D_J'])
-            
-            if d_avg <= 0:
-                break
+        ladder = sample_statistical_ladder(
+            params['E'], params['D_J'], params['Gn0'], params['Gg'],
+            l, j, params['AMUN'], 1, # NDOF_gg is always 1
+            mass, radius # Pass mass and radius for penetrability calculation
+        )
 
-            # Sample the next spacing from the Wigner distribution
-            #spacing = sesh_sampler.Wigner(d_avg, 1)[0]
-
-            spacing = d_avg*wig_factor[i]
-            if spacing <= 1e-9: spacing = 1e-9
-
-            e_r = current_e + spacing
-            
-            if e_r >= e_max:
-                break
-            
-            # Interpolate widths at the new resonance energy
-            gn0_avg = np.interp(e_r, data['E'], data['Gn0'])
-            gg_avg = np.interp(e_r, data['E'], data['Gg'])
-
-            # Calculate penetrability (VL)
-            EkeV = e_r / 1000.0
-            AK = sesh_sampler.chan_rad * np.sqrt(EkeV / sesh_sampler.AA) / 143.92
-            VL = sesh_sampler.Pf(AK, l) / AK if AK > 0 else 0
-            
-            # Convert average reduced width to average full width
-            gn_avg = gn0_avg * np.sqrt(e_r) * VL
-
-            gn = gn_avg*np.random.chisquare(data['AMUN'])
-
-            # Sample the full neutron width from the Porter-Thomas distribution
-            #gn = sesh_sampler.Porter(gn_avg, 1)[0]
-            
-            # Add the new resonance to the full ladder
-            full_ladder.append((e_r, l, j, gn, gg_avg))
-            
-            current_e = e_r
-            
-    # Sort the final combined ladder by energy
-    full_ladder.sort(key=lambda x: x[0])
+        full_ladder.extend(ladder)
     
-    return full_ladder, e_min, e_max
+    # Sort the combined ladder by energy
+    full_ladder.sort(key=lambda x: x['E'])
+    
+    # Calculate Gn0 for each resonance
+    energies = np.array([res['E'] for res in full_ladder])
+    penetrabilities = p_factors_vec(energies, mass, radius, max_l)
+    
+    for i, res in enumerate(full_ladder):
+        l = res['L']
+        E_r = res['E']
+        P_l_at_E = penetrabilities[l, i]
+        
+        if E_r > 0 and P_l_at_E > 1e-9:
+             # PySesh returns Gn, convert back to Gn0 for R-Matrix use
+            res['Gn0'] = res['Gn'] / (np.sqrt(E_r) * P_l_at_E)
+        else:
+            res['Gn0'] = 0.0
 
-def generate_and_write_ladder(task_args):
-    """Worker function to generate one ladder and write it to a file."""
-    params_by_channel, mass, radius, output_filename, isotope_name, spin = task_args
-    
-    resonance_ladder, e_min, e_max = sample_full_ladder(params_by_channel, mass, radius)
-    
+    # Write the ladder to a CSV file
     with open(output_filename, 'w', newline='') as f:
         writer = csv.writer(f, delimiter=';')
         f.write(f"# Isotope: {isotope_name}\n")
         f.write(f"# Ground State Spin (I): {spin}\n")
         f.write(f"# Atomic Mass (A): {mass}\n")
         f.write(f"# Channel Radius (a): {radius}\n")
-        f.write(f"# Ladder sampled from {e_min:.2f} eV to {e_max:.2f} eV\n")
-        writer.writerow(["E_r (eV)", "L", "J", "Gn (eV)", "Gg (eV)"])
+        f.write(f"# Ladder sampled from {min(energies):.2f} eV to {max(energies):.2f} eV\n")
         
-        for res in resonance_ladder:
-            writer.writerow([f"{res[0]:.4f}", res[1], res[2], f"{res[3]:.6e}", f"{res[4]:.6e}"])
+        header = ['E_r (eV)', 'L', 'J', 'Gn (eV)', 'Gg (eV)', 'Gn0 (eV)']
+        writer.writerow(header)
+        for res in full_ladder:
+            writer.writerow([res['E'], res['L'], res['J'], res['Gn'], res['Gg'], res['Gn0']])
             
     return output_filename
 
@@ -171,10 +253,9 @@ def main():
         tasks.append((params_by_channel, args.mass, args.radius, output_filename, isotope_name, spin))
 
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        results = list(tqdm(executor.map(generate_and_write_ladder, tasks), total=len(tasks), desc=f"Generating {args.num_ladders} ladders for {isotope_name}"))
+        list(tqdm(executor.map(generate_and_write_ladder, tasks), total=len(tasks), desc=f"Sampling {isotope_name} Ladders"))
 
-    print(f"\nProcessing complete. {len(results)} ladder files written to {args.output_dir}.")
+    print(f"\nFinished sampling. Ladders saved in {args.output_dir}")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

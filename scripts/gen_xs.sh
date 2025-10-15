@@ -17,7 +17,7 @@ zr92_mass=91.9050
 zr92_radius=7.20
 zr92_spin=0.0
 
-zr94_mass=93.9056
+zr94_mass=93.9063
 zr94_radius=7.20
 zr94_spin=0.0
 
